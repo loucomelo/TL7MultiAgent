@@ -3,16 +3,23 @@
 // PATCH approves or rejects a pending item — this is the ONLY path by which
 // anything reaches approvedLearnings and gets injected into future analyses.
 
+import { auth } from "@clerk/nextjs/server";
 import { getPending, getApproved, approvePending, rejectPending, updatePending } from "../../../lib/storage";
 
 export const runtime = "nodejs";
 
 export async function GET() {
+  const { userId } = await auth();
+  if (!userId) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
   const [pending, approved] = await Promise.all([getPending(), getApproved()]);
   return Response.json({ pending, approved });
 }
 
 export async function PATCH(req) {
+  const { userId } = await auth();
+  if (!userId) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
   try {
     const { id, action, useRewrite, editedText } = await req.json();
     if (!id || !action) {

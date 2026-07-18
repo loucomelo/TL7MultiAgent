@@ -3,46 +3,18 @@
 // pending review queue. NOTHING here writes to approvedLearnings — that only
 // happens via an explicit PATCH to /api/learnings from the operator.
 
+import { auth } from "@clerk/nextjs/server";
 import { FACT_CHECK_SYSTEM_PROMPT } from "../../../lib/prompts";
+import { callAgent } from "../../../lib/anthropic";
 import { addPending } from "../../../lib/storage";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-async function callAgent(systemPrompt, userMessage, useSearch = false) {
-  const body = {
-    model: "claude-sonnet-4-6",
-    max_tokens: 800,
-    system: systemPrompt,
-    messages: [{ role: "user", content: userMessage }],
-  };
-  if (useSearch) {
-    body.tools = [{ type: "web_search_20250305", name: "web_search" }];
-  }
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "Unknown error");
-    throw new Error(`Agent call failed (${response.status}): ${errText}`);
-  }
-
-  const data = await response.json();
-  return data.content
-    .map((block) => (block.type === "text" ? block.text : ""))
-    .filter(Boolean)
-    .join("\n");
-}
-
 export async function POST(req) {
+  const { userId } = await auth();
+  if (!userId) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
   try {
     const { candidateLearning, sourceQuestion } = await req.json();
     if (!candidateLearning) {

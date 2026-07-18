@@ -1,9 +1,14 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
+import { UserButton } from "@clerk/nextjs";
 
-// NOTE: v5.0 — all system prompts and Anthropic API calls now live server-side
-// in app/api/analyze, app/api/factcheck, app/api/learnings. This component only
-// calls those routes. See lib/prompts.js for the actual agent prompts.
+// NOTE: v5.1 — all system prompts and Anthropic API calls live server-side in
+// app/api/agents/{l7,primary,adversarial,meta}, app/api/factcheck, and
+// app/api/learnings. This component only calls those routes. See lib/prompts.js
+// for the actual agent prompts. Each agent is now its OWN endpoint (not one
+// combined /api/analyze) so no single serverless invocation can hit the 60s
+// platform timeout — and the client gets true progressive updates per phase
+// instead of one blocking call it has to fully parse or fully fail on.
 
 // ─── STOCK DATA ────────────────────────────────────────────────────────────
 const SECTOR_STOCKS = {
@@ -307,43 +312,86 @@ const AGENT_PHASES = [
   { key: "meta",        label: "Calibrating & weighing",  color: "#4ade80" },
 ];
 
-async function runAnalysisPipeline(query, historyText, learningsHistory) {
-  const res = await fetch("/api/analyze", {
+// Vercel returns its own HTML/text page on a platform-level failure (timeout,
+// gateway error, cold-start crash) — that response is NOT JSON, and blindly
+// calling response.json() on it throws "Unexpected token" instead of a useful
+// error. This wrapper checks content-type first and always surfaces something
+// readable.
+async function safeJsonFetch(url, options) {
+  const res = await fetch(url, options);
+  const contentType = res.headers.get("content-type") || "";
+
+  if (!contentType.includes("application/json")) {
+    const text = await res.text().catch(() => "");
+    const snippet = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 140);
+    throw new Error(
+      res.status === 504 || res.status === 502
+        ? `Server timed out (${res.status}). ${snippet || "The request took too long."}`
+        : `Unexpected response (${res.status}): ${snippet || "non-JSON response from server."}`
+    );
+  }
+
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status}).`);
+  return data;
+}
+
+async function runL7Agent(query) {
+  const data = await safeJsonFetch("/api/agents/l7", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, historyText, learningsHistory }),
+    body: JSON.stringify({ query }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Analysis pipeline failed.");
-  return data; // { content, l7Data, engineLearning, agents }
+  return data.l7Data;
+}
+
+async function runPrimaryAgent(query, l7Data, historyText, learningsHistory) {
+  const data = await safeJsonFetch("/api/agents/primary", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, l7Data, historyText, learningsHistory }),
+  });
+  return data.primaryOutput;
+}
+
+async function runAdversarialAgent(query, primaryOutput, l7Data) {
+  const data = await safeJsonFetch("/api/agents/adversarial", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, primaryOutput, l7Data }),
+  });
+  return data.adversarialOutput;
+}
+
+async function runMetaReviewer(query, l7Data, primaryOutput, adversarialOutput, learningsHistory) {
+  const data = await safeJsonFetch("/api/agents/meta", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, l7Data, primaryOutput, adversarialOutput, learningsHistory }),
+  });
+  return data; // { metaOutput, engineLearning }
 }
 
 async function runFactCheck(candidateLearning, sourceQuestion) {
-  const res = await fetch("/api/factcheck", {
+  const data = await safeJsonFetch("/api/factcheck", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ candidateLearning, sourceQuestion }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Fact-check failed.");
-  return data.item; // { id, ts, raw, sourceQuestion, status, factCheck }
+  return data.item;
 }
 
 async function fetchLearnings() {
-  const res = await fetch("/api/learnings");
-  if (!res.ok) throw new Error("Could not load learnings.");
-  return res.json(); // { pending, approved }
+  const data = await safeJsonFetch("/api/learnings", { method: "GET" });
+  return data; // { pending, approved }
 }
 
 async function patchLearning(id, action, opts = {}) {
-  const res = await fetch("/api/learnings", {
+  return safeJsonFetch("/api/learnings", {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id, action, ...opts }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Update failed.");
-  return data;
 }
 
 
@@ -544,7 +592,7 @@ export default function ThinkingLayer() {
 
   const download = (m, id) => {
     try {
-      const blob = new Blob([m.content + "\n\n— Thinking Layer v4.0 · Multi-Agent Debate · Research only, not financial advice"], {type:"text/markdown"});
+      const blob = new Blob([m.content + "\n\n— Thinking Layer v5.1 · Multi-Agent Debate · Research only, not financial advice"], {type:"text/markdown"});
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url; a.download = `thinking-layer-analysis-${id+1}.md`;
@@ -561,7 +609,12 @@ export default function ThinkingLayer() {
     try { await navigator.clipboard.writeText(m.content); setCopiedId(id); setTimeout(()=>setCopiedId(null), 1600); } catch {}
   };
 
-  // ─── ORCHESTRATOR (delegates the whole 4-agent pipeline to /api/analyze) ──
+  // ─── ORCHESTRATOR ──────────────────────────────────────────────────────
+  // Calls each agent as its own request. Nothing here waits on a single
+  // giant call — Primary's output renders the moment it's back, then the
+  // same message gets extended in place as Adversarial and Meta land. If
+  // Adversarial or Meta fail, the operator still gets the Primary view
+  // instead of nothing.
   const handleSubmit = async () => {
     const qText = question.trim();
     if (!qText || loading) return;
@@ -572,32 +625,74 @@ export default function ThinkingLayer() {
     const historyText = messages.slice(-6).map(m => `${m.role==="user"?"User":"Analyst"}: ${m.content.slice(0, 800)}`).join("\n\n");
     const learningsHistory = approvedLearnings.length > 0 ? approvedLearnings.slice(-20).map(l => l.text).join("\n") : "";
 
-    // Simulate phase progress client-side while the server runs the real pipeline —
-    // the server call is a single request, but the operator should still see which
-    // agent is conceptually running. Timings are rough estimates per agent.
-    const phaseTimers = [
-      setTimeout(() => setPhase("primary"), 4000),
-      setTimeout(() => setPhase("adversarial"), 11000),
-      setTimeout(() => setPhase("meta"), 17000),
-    ];
+    let l7Data = null;
+    let primaryOutput = "";
+    let adversarialOutput = "";
+    let msgIndex = -1;
+
+    const pushOrUpdate = (content, extra = {}) => {
+      setMessages(prev => {
+        if (msgIndex === -1) {
+          msgIndex = prev.length;
+          return [...prev, { role: "assistant", content, ...extra }];
+        }
+        return prev.map((m, i) => i === msgIndex ? { ...m, content, ...extra } : m);
+      });
+    };
 
     try {
-      const result = await runAnalysisPipeline(qText, historyText, learningsHistory);
-      phaseTimers.forEach(clearTimeout);
+      // ── PHASE 1: L7 Crowd Signal (failure here is non-fatal — primary reasons without it) ──
+      setPhase("l7");
+      try {
+        l7Data = await runL7Agent(qText);
+      } catch (e) {
+        console.warn("L7 agent failed, continuing without crowd data:", e.message);
+      }
 
-      setMessages(prev => [...prev, {
-        role: "assistant",
-        content: result.content,
-        agents: result.agents,
-        learning: result.engineLearning,
-      }]);
+      // ── PHASE 2: Primary Analyst (failure here IS fatal — nothing to show) ──
+      setPhase("primary");
+      primaryOutput = await runPrimaryAgent(qText, l7Data, historyText, learningsHistory);
+      if (!primaryOutput?.trim()) throw new Error("Primary analyst returned an empty response.");
+      pushOrUpdate(primaryOutput, { agents: { l7: !!l7Data, primary: true } });
 
-      // ── FACT-CHECK (server-side, background — does not block the response) ──
-      if (result.engineLearning) {
+      // ── PHASE 3: Adversarial (renders in place once ready; degrades gracefully) ──
+      setPhase("adversarial");
+      try {
+        adversarialOutput = await runAdversarialAgent(qText, primaryOutput, l7Data);
+      } catch (e) {
+        adversarialOutput = `*Counter-analyst unavailable: ${e.message}*`;
+      }
+      pushOrUpdate(`${primaryOutput}\n\n${adversarialOutput}`, { agents: { l7: !!l7Data, primary: true, adversarial: true } });
+
+      // ── PHASE 4: Meta-Reviewer ──
+      setPhase("meta");
+      let metaOutput = "";
+      let engineLearning = null;
+      try {
+        const metaResult = await runMetaReviewer(qText, l7Data, primaryOutput, adversarialOutput, learningsHistory);
+        metaOutput = metaResult.metaOutput;
+        engineLearning = metaResult.engineLearning;
+      } catch (e) {
+        metaOutput = `*Meta-reviewer unavailable: ${e.message}*`;
+      }
+
+      const composed = [
+        primaryOutput, "", adversarialOutput, "", metaOutput, "",
+        engineLearning ? "---\n*Candidate learning flagged — sent for fact-check, awaiting your review.*" : "",
+        "", "Research and scenario analysis only — not personalised financial advice.",
+      ].filter(s => s !== undefined).join("\n").trim();
+
+      pushOrUpdate(composed, {
+        agents: { l7: !!l7Data, primary: true, adversarial: true, meta: true },
+        learning: engineLearning,
+      });
+
+      // ── FACT-CHECK (background — does not block the visible response) ──
+      if (engineLearning) {
         setFactChecking(true);
         try {
-          await runFactCheck(result.engineLearning, qText);
-          await refreshLearnings(); // pulls the new pending item with its verdict attached
+          await runFactCheck(engineLearning, qText);
+          await refreshLearnings();
         } catch (e) {
           console.warn("Fact-check failed:", e.message);
         } finally {
@@ -606,12 +701,15 @@ export default function ThinkingLayer() {
       }
 
     } catch (err) {
-      phaseTimers.forEach(clearTimeout);
-      setMessages(prev => [...prev, {
-        role: "assistant",
-        content: `⚠️ ${err.message || "Analysis pipeline failed."}`,
-        isError: true,
-      }]);
+      if (msgIndex === -1) {
+        setMessages(prev => [...prev, {
+          role: "assistant",
+          content: `⚠️ ${err.message || "Analysis pipeline failed."}`,
+          isError: true,
+        }]);
+      }
+      // If msgIndex !== -1, the primary view is already visible — leave it
+      // rather than replacing a real result with an error.
     } finally {
       setLoading(false);
       setPhase(null);
@@ -946,8 +1044,11 @@ export default function ThinkingLayer() {
       {/* ── TOP BAR ── */}
       <header className="cl-top">
         <div className="cl-top-r1">
-          <div className="cl-brand">THINKING LAYER <span className="cl-version">v4.0 MULTI-AGENT</span></div>
-          <button className="cl-newbtn" onClick={newChat}>+ New</button>
+          <div className="cl-brand">THINKING LAYER <span className="cl-version">v5.1 MULTI-AGENT</span></div>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <UserButton afterSignOutUrl="/sign-in" />
+            <button className="cl-newbtn" onClick={newChat}>+ New</button>
+          </div>
         </div>
         <div className="cl-top-r2">
           {ddBtn("markets","Markets & Stocks", stockCount+mktCount)}
